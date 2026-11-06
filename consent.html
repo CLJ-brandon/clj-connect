@@ -4,6 +4,8 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="robots" content="noindex">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self' 'sha256-+ls9/1C7oaIQ+f7tNotowHT6XNzM//aEN/sg4fvgFQM='; style-src 'unsafe-inline'; connect-src https://lieaqgpgftkizggrgxri.supabase.co; img-src 'self' data:; base-uri 'none'; form-action 'none'">
+  <meta name="referrer" content="no-referrer">
   <title>CLJ Connector Sign-in</title>
   <!--
     Sign-in + consent page for the CLJ Meta connector (Supabase Auth OAuth 2.1 server).
@@ -33,40 +35,48 @@
 <body>
   <main id="app"><p>Loading…</p></main>
 
-  <script type="module">
-    import { createClient } from "https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.118.0/+esm";
-
+  <!-- supabase-js 2.118.0 UMD build, vendored from the npm package (sha256 ee3be8de…3d3). No third-party CDN. -->
+  <script src="./supabase-2.118.0.js"></script>
+  <script>
+    (() => {
     const SUPABASE_URL = "https://lieaqgpgftkizggrgxri.supabase.co";
     const SUPABASE_PUBLISHABLE_KEY = "sb_publishable_3oaZ56xdwiqQwZQcb51ujg_qirpYf4O";
     const DOMAIN = "chrislovesjulia.com";
+    // Sign-ins may only be handed back to Claude.
+    const ALLOWED_REDIRECT_HOSTS = ["claude.ai", "claude.com"];
 
     const app = document.getElementById("app");
     const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
     const show = (html) => { app.innerHTML = html; };
     const fail = (msg) => show(`<h1>Can't connect</h1><p class="err">${esc(msg)}</p><p>Close this tab and try again from Claude. If it keeps happening, ask Brandon.</p>`);
+    const hostOf = (u) => { try { return new URL(u).hostname.toLowerCase(); } catch { return ""; } };
+    const toClaude = (u) => ALLOWED_REDIRECT_HOSTS.includes(hostOf(u));
 
-    const supabase = createClient(SUPABASE_URL, SUPABASE_PUBLISHABLE_KEY, {
-      auth: { flowType: "pkce", detectSessionInUrl: true, persistSession: true },
+    // Tab-scoped storage: the session lives only for this tab and is signed out after the decision.
+    const store = {
+      getItem: (k) => { try { return sessionStorage.getItem(k); } catch { return null; } },
+      setItem: (k, v) => { try { sessionStorage.setItem(k, v); } catch {} },
+      removeItem: (k) => { try { sessionStorage.removeItem(k); } catch {} },
+    };
+
+    const sb = window.supabase.createClient(SUPABASE_URL, SUPABASE_PUBLISHABLE_KEY, {
+      auth: { flowType: "pkce", detectSessionInUrl: true, persistSession: true, storage: store, storageKey: "clj-connect-auth" },
     });
+    const endSession = () => sb.auth.signOut({ scope: "local" }).catch(() => {});
 
     // Keep authorization_id across the Google round trip.
-    const store = {
-      get: (k) => { try { return sessionStorage.getItem(k); } catch { return null; } },
-      set: (k, v) => { try { sessionStorage.setItem(k, v); } catch {} },
-      del: (k) => { try { sessionStorage.removeItem(k); } catch {} },
-    };
     const params = new URLSearchParams(location.search);
     let authorizationId = params.get("authorization_id");
-    if (authorizationId) store.set("clj_authorization_id", authorizationId);
-    else authorizationId = store.get("clj_authorization_id");
+    if (authorizationId) store.setItem("clj_authorization_id", authorizationId);
+    else authorizationId = store.getItem("clj_authorization_id");
 
     async function run() {
       if (!authorizationId) return fail("This page only works as part of connecting Claude to a CLJ connector.");
 
-      const { data: { session } } = await supabase.auth.getSession();
+      const { data: { session } } = await sb.auth.getSession();
       if (!session) {
         const redirectTo = `${location.origin}${location.pathname}`;
-        const { error } = await supabase.auth.signInWithOAuth({
+        const { error } = await sb.auth.signInWithOAuth({
           provider: "google",
           options: { redirectTo, queryParams: { hd: DOMAIN, prompt: "select_account" } },
         });
@@ -76,22 +86,33 @@
 
       const email = (session.user.email ?? "").toLowerCase();
       if (!email.endsWith(`@${DOMAIN}`)) {
-        await supabase.auth.signOut();
+        await endSession();
         return fail(`Signed in as ${email}. Use your @${DOMAIN} Google account.`);
       }
 
-      const { data: details, error } = await supabase.auth.oauth.getAuthorizationDetails(authorizationId);
-      if (error || !details) return fail(error?.message ?? "This sign-in request has expired.");
+      const { data: details, error } = await sb.auth.oauth.getAuthorizationDetails(authorizationId);
+      if (error || !details) { await endSession(); return fail(error?.message ?? "This sign-in request has expired."); }
 
-      // Already approved before: go straight back to Claude.
+      // Already approved before: go straight back, but only to Claude.
       if (!("authorization_id" in details) && details.redirect_url) {
-        store.del("clj_authorization_id");
+        store.removeItem("clj_authorization_id");
+        await endSession();
+        if (!toClaude(details.redirect_url)) return fail("This request isn't from Claude, so it was stopped.");
         return location.replace(details.redirect_url);
       }
 
+      // Refuse any app that would send the sign-in somewhere other than Claude.
+      const requestedHost = hostOf(details.redirect_uri);
+      if (!ALLOWED_REDIRECT_HOSTS.includes(requestedHost)) {
+        await sb.auth.oauth.denyAuthorization(authorizationId).catch(() => {});
+        store.removeItem("clj_authorization_id");
+        await endSession();
+        return fail(`This request would send your sign-in to ${requestedHost || "an unknown site"}, not Claude, so it was stopped. Don't approve it, and let Brandon know.`);
+      }
+
       show(`
-        <h1>Connect ${esc(details.client?.name ?? "Claude")} to CLJ</h1>
-        <div class="who">Signed in as ${esc(email)}</div>
+        <h1>Connect Claude to CLJ</h1>
+        <div class="who">Signed in as ${esc(email)} · returning to ${esc(requestedHost)}</div>
         <p>This lets Claude read CLJ's Instagram and Facebook data:</p>
         <ul>
           <li>Posts, captions and links</li>
@@ -106,10 +127,12 @@
 
       const decide = async (approve) => {
         document.querySelectorAll("button").forEach((b) => (b.disabled = true));
-        const fn = approve ? supabase.auth.oauth.approveAuthorization : supabase.auth.oauth.denyAuthorization;
-        const { data, error } = await fn.call(supabase.auth.oauth, authorizationId);
-        store.del("clj_authorization_id");
+        const fn = approve ? sb.auth.oauth.approveAuthorization : sb.auth.oauth.denyAuthorization;
+        const { data, error } = await fn.call(sb.auth.oauth, authorizationId);
+        store.removeItem("clj_authorization_id");
+        await endSession();
         if (error) return fail(error.message);
+        if (!toClaude(data.redirect_url)) return fail("Unexpected return address, so it was stopped. Let Brandon know.");
         location.replace(data.redirect_url);
       };
       document.getElementById("approve").onclick = () => decide(true);
@@ -117,6 +140,7 @@
     }
 
     run().catch((e) => fail(e?.message ?? String(e)));
+    })();
   </script>
 </body>
 </html>
